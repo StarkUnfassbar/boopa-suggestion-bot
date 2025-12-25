@@ -5,16 +5,17 @@ import re
 import hashlib
 import json
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Optional
+from typing import Dict, Optional, List, Any
 from collections import defaultdict
 from dataclasses import dataclass
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
-import gspread
-from google.oauth2.service_account import Credentials
-from gspread_formatting import *
 import requests
+
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 load_dotenv()
 
@@ -24,16 +25,67 @@ SPREADSHEET_ID = os.getenv('GOOGLE_SPREADSHEET_ID')
 SHEET_NAME = os.getenv('GOOGLE_SHEET_NAME', 'Sheet1')
 YOUTUBE_API_KEY = os.getenv('YOUTUBE_API_KEY')
 
-# Константа для ссылки на канал Бупы
 BUPA_CHANNEL_LINK = "t.me/boopablup"
 
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
+# ------------------ Настройка логгирования в файл ------------------
 
-# ------------------ Безопасные структуры данных ------------------
+def setup_logging():
+    """Настройка логгирования в файл"""
+    log_dir = "logs"
+    if not os.path.exists(log_dir):
+        os.makedirs(log_dir)
+    
+    current_time = datetime.now().strftime("%Y-%m-%d")
+    log_file = os.path.join(log_dir, f"bot_{current_time}.log")
+    
+    class CustomFormatter(logging.Formatter):
+        def format(self, record):
+            record.asctime = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            return super().format(record)
+    
+    class HttpxNoiseFilter(logging.Filter):
+        def __init__(self):
+            super().__init__()
+            self.noise_patterns = [
+                "HTTP Request:.*/getUpdates.*HTTP/1.1 200 OK",
+            ]
+        
+        def filter(self, record):
+            if record.name != "httpx" or record.levelno != logging.INFO:
+                return True
+            
+            message = record.getMessage()
+            
+            for pattern in self.noise_patterns:
+                import re
+                if re.search(pattern, message, re.IGNORECASE):
+                    return False
+            
+            return True
+    
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    
+    logger.handlers.clear()
+    
+    file_handler = logging.FileHandler(log_file, encoding='utf-8')
+    file_handler.setLevel(logging.INFO)
+    
+    file_handler.addFilter(HttpxNoiseFilter())
+    
+    file_formatter = CustomFormatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    file_handler.setFormatter(file_formatter)
+    
+    logger.addHandler(file_handler)
+    
+    return logger
+
+logger = setup_logging()
+
+# ------------------ Глобальные переменные и структуры данных ------------------
+
 @dataclass
 class PendingVideo:
     """Безопасная структура для хранения ожидающих видео"""
@@ -80,16 +132,20 @@ class WriteQueue:
         self._queue = asyncio.Queue()
         self._max_concurrent = max_concurrent
         self._delay = delay_seconds
-        self._current_tasks = 0
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._worker_task = None
+        self._is_running = False
     
     async def start(self):
         """Запуск обработчика очереди"""
+        if self._is_running:
+            return
+        self._is_running = True
         self._worker_task = asyncio.create_task(self._process_queue())
     
     async def stop(self):
         """Остановка обработчика очереди"""
+        self._is_running = False
         if self._worker_task:
             self._worker_task.cancel()
             try:
@@ -99,13 +155,16 @@ class WriteQueue:
     
     async def add_write_task(self, task_func, *args, **kwargs):
         """Добавление задачи в очередь на запись"""
+        if not self._is_running:
+            raise Exception("Очередь записи не запущена")
+        
         future = asyncio.get_event_loop().create_future()
         await self._queue.put((future, task_func, args, kwargs))
         return await future
     
     async def _process_queue(self):
         """Обработчик очереди записей"""
-        while True:
+        while self._is_running:
             try:
                 future, task_func, args, kwargs = await self._queue.get()
                 
@@ -116,142 +175,634 @@ class WriteQueue:
                     except Exception as e:
                         future.set_exception(e)
                     
-                    # Задержка между записями
                     await asyncio.sleep(self._delay)
-                    
-                self._queue.task_done()
                 
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Ошибка в обработчике очереди: {e}")
+                if not future.done():
+                    future.set_exception(e)
+            finally:
+                if not self._queue.empty():
+                    self._queue.task_done()
 
-# Глобальные экземпляры безопасных структур
 pending_videos = SafeVideoStorage()
 write_queue = WriteQueue(max_concurrent=1, delay_seconds=2.0)
 
-# Словари для хранения статистики (оставляем простыми, т.к. данные не критичны)
 user_submissions = defaultdict(int)
 
-# Множество для отслеживания пользователей, которые уже использовали /start
-# Ключ: (chat_id, user_id)
 started_users = set()
 
 YOUTUBE_REGEX = r'(https?://)?(www\.)?(youtube|youtu|youtube-nocookie)\.(com|be)/(watch\?v=|embed/|v/|.+\?v=)?([^&=%\?]{11})'
 
-COLUMN_A_WIDTH = 120
+COLUMN_A_WIDTH = 150
 COLUMN_B_WIDTH = 300
-COLUMN_C_WIDTH = 300
-COLUMN_D_WIDTH = 200
-COLUMN_E_WIDTH = 200
-ROW_HEIGHT = 100
+COLUMN_C_WIDTH = 110
+COLUMN_D_WIDTH = 220
+COLUMN_E_WIDTH = 170
+COLUMN_F_WIDTH = 200
+COLUMN_G_WIDTH = 130
+ROW_HEIGHT = 115
+FIRST_ROW_HEIGHT = 40
+SECOND_ROW_HEIGHT = 40
 
-# Обновленные заголовки с новым столбцом
-EXPECTED_HEADERS = ['Превью', 'Название видео', 'Ссылка', 'Кем предложено', 'Дата добавления']
+EXPECTED_HEADERS = ['Превью', 'Название видео', 'Длительность', 'Ссылка', 'Кем предложено', 'Дата добавления', 'Статус']
 
-# Московское время (UTC+3)
 MOSCOW_UTC_OFFSET = 3
 
-# ------------------ Инициализация Google Sheets ------------------
-_sheet_instance = None
-_sheet_lock = asyncio.Lock()
+# ------------------ Глобальный сервис Google Sheets ------------------
 
-async def get_google_sheet():
-    """Потокобезопасное получение экземпляра Google Sheets"""
-    global _sheet_instance
-    async with _sheet_lock:
-        if _sheet_instance is None:
-            _sheet_instance = await asyncio.to_thread(init_google_sheets_sync)
-        return _sheet_instance
+_sheets_service = None
+_sheets_lock = asyncio.Lock()
+_sheet_id = None
+_is_initialized = False
 
-def init_google_sheets_sync():
-    """Синхронная инициализация Google Sheets (выполняется в отдельном потоке)"""
+async def get_sheets_service():
+    """Потокобезопасное получение экземпляра Google Sheets API"""
+    global _sheets_service
+    async with _sheets_lock:
+        if _sheets_service is None:
+            _sheets_service = await asyncio.to_thread(init_sheets_service_sync)
+        return _sheets_service
+
+def init_sheets_service_sync():
+    """Синхронная инициализация Google Sheets API (выполняется в отдельном потоке)"""
     try:
-        scope = ['https://www.googleapis.com/auth/spreadsheets']
-        creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=scope)
-        client = gspread.authorize(creds)
-        spreadsheet = client.open_by_key(SPREADSHEET_ID)
+        SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
         
-        try:
-            sheet = spreadsheet.worksheet(SHEET_NAME)
-        except gspread.exceptions.WorksheetNotFound:
-            sheet = spreadsheet.add_worksheet(title=SHEET_NAME, rows=1000, cols=5)
+        creds = Credentials.from_service_account_file(
+            SERVICE_ACCOUNT_FILE, 
+            scopes=SCOPES
+        )
         
-        logger.info("Подключение к Google Sheets установлено.")
-        return sheet
+        service = build('sheets', 'v4', credentials=creds)
+        
+        logger.info("Подключение к Google Sheets API установлено.")
+        return service
     except Exception as e:
-        logger.error(f"Ошибка при инициализации Google Sheets: {e}")
+        logger.error(f"Ошибка при инициализации Google Sheets API: {e}")
         return None
 
-async def ensure_headers_and_formatting(worksheet):
-    """Асинхронная проверка заголовков и форматирование таблицы"""
+async def get_sheet_id_cached(service):
+    """Получение ID листа с кэшированием"""
+    global _sheet_id
+    if _sheet_id is not None:
+        return _sheet_id
+    
     try:
-        loop = asyncio.get_event_loop()
+        spreadsheet = service.spreadsheets()
+        result = spreadsheet.get(spreadsheetId=SPREADSHEET_ID).execute()
         
-        # Проверяем и обновляем заголовки если нужно
-        current_headers = await loop.run_in_executor(None, worksheet.row_values, 1)
+        for sheet in result.get('sheets', []):
+            if sheet['properties']['title'] == SHEET_NAME:
+                _sheet_id = sheet['properties']['sheetId']
+                return _sheet_id
         
-        needs_update = False
+        return None
+    except Exception as e:
+        logger.error(f"Ошибка при получении ID листа: {e}")
+        return None
+
+async def ensure_sheet_exists(service):
+    """Проверка существования листа и его создание при необходимости"""
+    try:
+        spreadsheet = service.spreadsheets()
+        result = spreadsheet.get(spreadsheetId=SPREADSHEET_ID).execute()
         
-        if len(current_headers) < len(EXPECTED_HEADERS):
-            needs_update = True
-        elif current_headers != EXPECTED_HEADERS:
-            needs_update = True
+        for sheet in result.get('sheets', []):
+            if sheet['properties']['title'] == SHEET_NAME:
+                return True
         
-        if needs_update:
-            if current_headers:
-                await loop.run_in_executor(
-                    None,
-                    lambda: worksheet.update(values=[['' for _ in range(5)]], range_name='A1:E1')
-                )
+        requests = [{
+            'addSheet': {
+                'properties': {
+                    'title': SHEET_NAME,
+                    'gridProperties': {
+                        'rowCount': 1000,
+                        'columnCount': len(EXPECTED_HEADERS)
+                    }
+                }
+            }
+        }]
+        
+        body = {'requests': requests}
+        spreadsheet.batchUpdate(spreadsheetId=SPREADSHEET_ID, body=body).execute()
+        return True
+        
+    except Exception as e:
+        logger.error(f"Ошибка при проверке/создании листа: {e}")
+        return False
+
+async def initialize_google_sheets():
+    """Инициализация Google Sheets при запуске бота"""
+    global _is_initialized
+    
+    if _is_initialized:
+        return True
+    
+    try:
+        service = await get_sheets_service()
+        if service is None:
+            logger.error("Не удалось получить сервис Google Sheets")
+            return False
+        
+        if not await ensure_sheet_exists(service):
+            logger.error(f"Не удалось создать лист {SHEET_NAME}")
+            return False
+        
+        await get_sheet_id_cached(service)
+        
+        await ensure_headers_and_formatting()
+        
+        _is_initialized = True
+        logger.info("Google Sheets успешно инициализирован")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Ошибка при инициализации Google Sheets: {e}")
+        return False
+
+async def get_total_rows():
+    """Получение общего количества строк с данными в таблице"""
+    try:
+        service = await get_sheets_service()
+        if service is None:
+            return 0
+        
+        spreadsheet = service.spreadsheets()
+        
+        result = spreadsheet.values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"{SHEET_NAME}!A:{chr(65 + len(EXPECTED_HEADERS) - 1)}"
+        ).execute()
+        
+        values = result.get('values', [])
+        return len(values)
+        
+    except Exception as e:
+        logger.error(f"Ошибка при получении количества строк: {e}")
+        return 0
+
+async def apply_formatting_after_add(total_rows: int):
+    """Применяет форматирование после добавления новой строки"""
+    try:
+        service = await get_sheets_service()
+        if service is None:
+            return False
+        
+        spreadsheet = service.spreadsheets()
+        
+        sheet_id = await get_sheet_id_cached(service)
+        if sheet_id is None:
+            return False
+        
+        BORDER_STYLE = {
+            'style': 'SOLID',
+            'width': 1,
+            'color': {'red': 0.0, 'green': 0.0, 'blue': 0.0}
+        }
+        
+        WHITE_BACKGROUND = {
+            'red': 1.0,
+            'green': 1.0,
+            'blue': 1.0
+        }
+        
+        num_columns = len(EXPECTED_HEADERS)
+        
+        formatting_requests = []
+        
+        formatting_requests.append({
+            'repeatCell': {
+                'range': {
+                    'sheetId': sheet_id,
+                    'startRowIndex': 2,
+                    'endRowIndex': total_rows,
+                    'startColumnIndex': 0,
+                    'endColumnIndex': num_columns
+                },
+                'cell': {
+                    'userEnteredFormat': {
+                        'verticalAlignment': 'MIDDLE',
+                        'wrapStrategy': 'WRAP',
+                        'backgroundColor': WHITE_BACKGROUND,
+                        'borders': {
+                            'top': BORDER_STYLE,
+                            'bottom': BORDER_STYLE,
+                            'left': BORDER_STYLE,
+                            'right': BORDER_STYLE
+                        }
+                    }
+                },
+                'fields': 'userEnteredFormat(verticalAlignment,wrapStrategy,backgroundColor,borders)'
+            }
+        })
+        
+        text_columns = [0, 1, 2, 4, 5, 6]
+        
+        for col_idx in text_columns:
+            if col_idx < num_columns:
+                formatting_requests.append({
+                    'repeatCell': {
+                        'range': {
+                            'sheetId': sheet_id,
+                            'startRowIndex': 2,
+                            'endRowIndex': total_rows,
+                            'startColumnIndex': col_idx,
+                            'endColumnIndex': col_idx + 1
+                        },
+                        'cell': {
+                            'userEnteredFormat': {
+                                'textFormat': {
+                                    'bold': False,
+                                    'fontSize': 10
+                                }
+                            }
+                        },
+                        'fields': 'userEnteredFormat(textFormat)'
+                    }
+                })
+        
+        row_requests = []
+        if total_rows > 2:
+            row_requests.append({
+                'updateDimensionProperties': {
+                    'range': {
+                        'sheetId': sheet_id,
+                        'dimension': 'ROWS',
+                        'startIndex': 2,
+                        'endIndex': total_rows
+                    },
+                    'properties': {
+                        'pixelSize': ROW_HEIGHT
+                    },
+                    'fields': 'pixelSize'
+                }
+            })
+        
+        if formatting_requests or row_requests:
+            batch_update_request = {
+                'requests': formatting_requests + row_requests
+            }
             
-            await loop.run_in_executor(
-                None,
-                lambda: worksheet.update(values=[EXPECTED_HEADERS], range_name='A1:E1')
-            )
-            
-            await loop.run_in_executor(
-                None,
-                lambda: worksheet.format('A1:E1', {'textFormat': {'bold': True}})
-            )
-            
-            logger.info("Заголовки таблицы обновлены")
+            spreadsheet.batchUpdate(
+                spreadsheetId=SPREADSHEET_ID,
+                body=batch_update_request
+            ).execute()
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"Ошибка при применении форматирования: {e}")
+        return False
+
+async def create_dropdown_for_new_row(row_index: int):
+    """Создает раскрывающийся список для новой строки в стиле Чип"""
+    try:
+        service = await get_sheets_service()
+        if service is None:
+            return False
+        
+        spreadsheet = service.spreadsheets()
+        
+        sheet_id = await get_sheet_id_cached(service)
+        if sheet_id is None:
+            return False
+        
+        dropdown_request = {
+            'setDataValidation': {
+                'range': {
+                    'sheetId': sheet_id,
+                    'startRowIndex': row_index - 1,
+                    'endRowIndex': row_index,
+                    'startColumnIndex': len(EXPECTED_HEADERS) - 1,
+                    'endColumnIndex': len(EXPECTED_HEADERS)
+                },
+                'rule': {
+                    'condition': {
+                        'type': 'ONE_OF_LIST',
+                        'values': [
+                            {'userEnteredValue': 'не просмотрено'},
+                            {'userEnteredValue': 'просмотрено'},
+                            {'userEnteredValue': 'удалить'}
+                        ]
+                    },
+                    'strict': True,
+                    'showCustomUi': True,
+                    'inputMessage': 'Выберите статус просмотра'
+                }
+            }
+        }
+        
+        batch_update_request = {
+            'requests': [dropdown_request]
+        }
+        
+        spreadsheet.batchUpdate(
+            spreadsheetId=SPREADSHEET_ID,
+            body=batch_update_request
+        ).execute()
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"Ошибка при создании выпадающего списка: {e}")
+        return False
+
+async def ensure_headers_and_formatting():
+    """Асинхронное форматирование таблицы через Google Sheets API v4"""
+    try:
+        service = await get_sheets_service()
+        if service is None:
+            return False
+        
+        spreadsheet = service.spreadsheets()
+        
+        result = spreadsheet.values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"{SHEET_NAME}!A1:{chr(65 + len(EXPECTED_HEADERS) - 1)}2"
+        ).execute()
+        
+        values = result.get('values', [])
+        
+        needs_restructure = False
+        
+        if len(values) < 2:
+            needs_restructure = True
         else:
-            await loop.run_in_executor(
-                None,
-                lambda: worksheet.format('A1:E1', {'textFormat': {'bold': True}})
-            )
-            logger.info("Заголовки таблицы уже правильные")
+            first_row = values[0] if len(values) > 0 else []
+            second_row = values[1] if len(values) > 1 else []
+            
+            if second_row != EXPECTED_HEADERS:
+                needs_restructure = True
         
-        # Применяем форматирование
-        await loop.run_in_executor(
-            None,
-            lambda: (
-                set_column_width(worksheet, 'A', COLUMN_A_WIDTH),
-                set_column_width(worksheet, 'B', COLUMN_B_WIDTH),
-                set_column_width(worksheet, 'C', COLUMN_C_WIDTH),
-                set_column_width(worksheet, 'D', COLUMN_D_WIDTH),
-                set_column_width(worksheet, 'E', COLUMN_E_WIDTH),
-                set_row_height(worksheet, '2:', ROW_HEIGHT)
-            )
-        )
+        if needs_restructure:
+            all_result = spreadsheet.values().get(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"{SHEET_NAME}!A:{chr(65 + len(EXPECTED_HEADERS) - 1)}"
+            ).execute()
+            
+            all_values = all_result.get('values', [])
+            
+            new_values = []
+            
+            first_row_text = f"Предложить видео сюда → @BoopaSuggestionBot"
+            new_values.append([first_row_text])
+            
+            new_values.append(EXPECTED_HEADERS)
+            
+            if len(all_values) > 0 and all_values[0] == EXPECTED_HEADERS:
+                for row in all_values[1:]:
+                    new_values.append(row)
+            else:
+                for row in all_values:
+                    if row:
+                        new_values.append(row)
+            
+            spreadsheet.values().clear(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"{SHEET_NAME}!A:{chr(65 + len(EXPECTED_HEADERS) - 1)}"
+            ).execute()
+            
+            body = {
+                'values': new_values
+            }
+            spreadsheet.values().update(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"{SHEET_NAME}!A1",
+                valueInputOption='USER_ENTERED',
+                body=body
+            ).execute()
         
-        fmt = cellFormat(
-            verticalAlignment='MIDDLE',
-            wrapStrategy='WRAP'
-        )
+        sheet_id = await get_sheet_id_cached(service)
+        if sheet_id is None:
+            return False
         
-        await loop.run_in_executor(
-            None,
-            lambda: format_cell_range(worksheet, 'A2:E1000', fmt)
-        )
+        total_rows = await get_total_rows()
+        if total_rows < 2:
+            total_rows = 2
         
-        logger.info("Форматирование таблицы применено.")
+        num_columns = len(EXPECTED_HEADERS)
+        
+        merge_request = [{
+            'mergeCells': {
+                'mergeType': 'MERGE_ALL',
+                'range': {
+                    'sheetId': sheet_id,
+                    'startRowIndex': 0,
+                    'endRowIndex': 1,
+                    'startColumnIndex': 0,
+                    'endColumnIndex': num_columns
+                }
+            }
+        }]
+        
+        BACKGROUND_COLOR = {
+            'red': 1.0,
+            'green': 0.804,
+            'blue': 0.929
+        }
+        
+        BORDER_STYLE = {
+            'style': 'SOLID',
+            'width': 1,
+            'color': {'red': 0.0, 'green': 0.0, 'blue': 0.0}
+        }
+        
+        formatting_requests = [
+            {
+                'repeatCell': {
+                    'range': {
+                        'sheetId': sheet_id,
+                        'startRowIndex': 0,
+                        'endRowIndex': 1,
+                        'startColumnIndex': 0,
+                        'endColumnIndex': num_columns
+                    },
+                    'cell': {
+                        'userEnteredFormat': {
+                            'backgroundColor': BACKGROUND_COLOR,
+                            'horizontalAlignment': 'CENTER',
+                            'verticalAlignment': 'MIDDLE',
+                            'borders': {
+                                'top': BORDER_STYLE,
+                                'bottom': BORDER_STYLE,
+                                'left': BORDER_STYLE,
+                                'right': BORDER_STYLE
+                            }
+                        }
+                    },
+                    'fields': 'userEnteredFormat(backgroundColor,horizontalAlignment,verticalAlignment,borders)'
+                }
+            },
+            {
+                'repeatCell': {
+                    'range': {
+                        'sheetId': sheet_id,
+                        'startRowIndex': 1,
+                        'endRowIndex': 2,
+                        'startColumnIndex': 0,
+                        'endColumnIndex': num_columns
+                    },
+                    'cell': {
+                        'userEnteredFormat': {
+                            'backgroundColor': BACKGROUND_COLOR,
+                            'textFormat': {
+                                'bold': True,
+                                'underline': False
+                            },
+                            'borders': {
+                                'top': BORDER_STYLE,
+                                'bottom': BORDER_STYLE,
+                                'left': BORDER_STYLE,
+                                'right': BORDER_STYLE
+                            }
+                        }
+                    },
+                    'fields': 'userEnteredFormat(backgroundColor,textFormat.bold,textFormat.underline,borders)'
+                }
+            }
+        ]
+        
+        column_widths = [COLUMN_A_WIDTH, COLUMN_B_WIDTH, COLUMN_C_WIDTH, COLUMN_D_WIDTH, COLUMN_E_WIDTH, COLUMN_F_WIDTH, COLUMN_G_WIDTH]
+        column_requests = []
+        
+        for i in range(min(num_columns, len(column_widths))):
+            column_requests.append({
+                'updateDimensionProperties': {
+                    'range': {
+                        'sheetId': sheet_id,
+                        'dimension': 'COLUMNS',
+                        'startIndex': i,
+                        'endIndex': i + 1
+                    },
+                    'properties': {
+                        'pixelSize': column_widths[i] if i < len(column_widths) else 100
+                    },
+                    'fields': 'pixelSize'
+                }
+            })
+        
+        for i in range(7, num_columns):
+            column_requests.append({
+                'updateDimensionProperties': {
+                    'range': {
+                        'sheetId': sheet_id,
+                        'dimension': 'COLUMNS',
+                        'startIndex': i,
+                        'endIndex': i + 1
+                    },
+                    'properties': {
+                        'pixelSize': 100
+                    },
+                    'fields': 'pixelSize'
+                }
+            })
+        
+        row_requests = [
+            {
+                'updateDimensionProperties': {
+                    'range': {
+                        'sheetId': sheet_id,
+                        'dimension': 'ROWS',
+                        'startIndex': 0,
+                        'endIndex': 1
+                    },
+                    'properties': {
+                        'pixelSize': FIRST_ROW_HEIGHT
+                    },
+                    'fields': 'pixelSize'
+                }
+            },
+            {
+                'updateDimensionProperties': {
+                    'range': {
+                        'sheetId': sheet_id,
+                        'dimension': 'ROWS',
+                        'startIndex': 1,
+                        'endIndex': 2
+                    },
+                    'properties': {
+                        'pixelSize': SECOND_ROW_HEIGHT
+                    },
+                    'fields': 'pixelSize'
+                }
+            }
+        ]
+        
+        batch_update_request = {
+            'requests': merge_request + formatting_requests + column_requests + row_requests
+        }
+        
+        spreadsheet.batchUpdate(
+            spreadsheetId=SPREADSHEET_ID,
+            body=batch_update_request
+        ).execute()
+        
+        result = spreadsheet.values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"{SHEET_NAME}!A1"
+        ).execute()
+        
+        if not result.get('values') or len(result.get('values', [])) == 0:
+            first_row_text = f"Предложить видео сюда → @BoopaSuggestionBot"
+            
+            body = {
+                'values': [[first_row_text]]
+            }
+            
+            spreadsheet.values().update(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"{SHEET_NAME}!A1",
+                valueInputOption='USER_ENTERED',
+                body=body
+            ).execute()
+        
+        format_update_request = {
+            'requests': [{
+                'repeatCell': {
+                    'range': {
+                        'sheetId': sheet_id,
+                        'startRowIndex': 0,
+                        'endRowIndex': 1,
+                        'startColumnIndex': 0,
+                        'endColumnIndex': 1
+                    },
+                    'cell': {
+                        'userEnteredFormat': {
+                            'horizontalAlignment': 'CENTER',
+                            'verticalAlignment': 'MIDDLE',
+                            'textFormat': {
+                                'bold': True,
+                                'fontSize': 10
+                            }
+                        }
+                    },
+                    'fields': 'userEnteredFormat(horizontalAlignment,verticalAlignment,textFormat)'
+                }
+            }]
+        }
+        
+        spreadsheet.batchUpdate(
+            spreadsheetId=SPREADSHEET_ID,
+            body=format_update_request
+        ).execute()
+        
+        if total_rows > 2:
+            for row_index in range(3, total_rows + 1):
+                await create_dropdown_for_new_row(row_index)
+        
+        await apply_formatting_after_add(total_rows)
+        
+        return True
         
     except Exception as e:
         logger.error(f"Ошибка при проверке заголовков и форматировании: {e}")
+        return False
 
 # ------------------ Вспомогательные функции ------------------
+
 def get_moscow_datetime():
     """Возвращает текущую дату и время по московскому времени"""
     utc_now = datetime.now(timezone.utc)
@@ -271,19 +822,26 @@ def format_moscow_date(moscow_dt):
     hour = moscow_dt.hour
     minute = moscow_dt.minute
     
-    return f"{day} {month} {year}, {hour:02d}:{minute:02d} (МСК)"
+    return f"{day} {month} {year}, {hour:02d}:{minute:02d}\u00A0(МСК)"
+
+def format_duration(seconds):
+    """Форматирует продолжительность в формат '0:00:00'"""
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    seconds = seconds % 60
+    return f"{hours}:{minutes:02d}:{seconds:02d}"
 
 async def fetch_video_info(video_id):
     """Асинхронное получение информации о видео"""
     if not YOUTUBE_API_KEY:
-        return None, None
+        return None, None, None
     
     try:
         url = f'https://www.googleapis.com/youtube/v3/videos'
         params = {
             'id': video_id,
             'key': YOUTUBE_API_KEY,
-            'part': 'snippet'
+            'part': 'snippet,contentDetails'
         }
         
         loop = asyncio.get_event_loop()
@@ -303,32 +861,54 @@ async def fetch_video_info(video_id):
                          thumbnails.get('standard', {}).get('url',
                          f'https://img.youtube.com/vi/{video_id}/hqdefault.jpg')))
             
-            return video_title, thumbnail_url
+            duration_str = data['items'][0]['contentDetails']['duration']
+            duration_seconds = parse_youtube_duration(duration_str)
+            formatted_duration = format_duration(duration_seconds)
+            
+            return video_title, thumbnail_url, formatted_duration
             
     except Exception as e:
         logger.error(f"Ошибка при получении информации о видео: {e}")
     
-    return None, None
+    return None, None, None
+
+def parse_youtube_duration(duration_str):
+    """Парсит продолжительность из формата YouTube ISO 8601 в секунды"""
+    match = re.match(r'PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?', duration_str)
+    if not match:
+        return 0
+    
+    hours = int(match.group(1)) if match.group(1) else 0
+    minutes = int(match.group(2)) if match.group(2) else 0
+    seconds = int(match.group(3)) if match.group(3) else 0
+    
+    return hours * 3600 + minutes * 60 + seconds
 
 async def get_video_count_from_sheet():
-    """Асинхронное получение количества видео (без форматирования таблицы)"""
+    """Асинхронное получение количества видео"""
     try:
-        sheet = await get_google_sheet()
-        if sheet is None:
+        service = await get_sheets_service()
+        if service is None:
             return 0
         
-        loop = asyncio.get_event_loop()
-        all_values = await loop.run_in_executor(None, sheet.get_all_values)
-        return len(all_values) - 1 if len(all_values) > 1 else 0
+        spreadsheet = service.spreadsheets()
+        
+        result = spreadsheet.values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"{SHEET_NAME}!A:{chr(65 + len(EXPECTED_HEADERS) - 1)}"
+        ).execute()
+        
+        values = result.get('values', [])
+        return len(values) - 2 if len(values) > 2 else 0
     except Exception as e:
-        logger.error(f"Ошибка при получении количества видео из таблицы: {e}")
+        logger.error(f"Ошибка при получении количества видео из таблица: {e}")
         return 0
 
 async def is_video_already_in_sheet(video_url):
     """Асинхронная проверка наличия видео в таблице"""
     try:
-        sheet = await get_google_sheet()
-        if sheet is None:
+        service = await get_sheets_service()
+        if service is None:
             return False
         
         video_id = extract_youtube_id(video_url)
@@ -337,12 +917,17 @@ async def is_video_already_in_sheet(video_url):
         
         short_link = f"https://youtu.be/{video_id}"
         
-        loop = asyncio.get_event_loop()
-        all_values = await loop.run_in_executor(None, sheet.get_all_values)
+        spreadsheet = service.spreadsheets()
+        result = spreadsheet.values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"{SHEET_NAME}!D:D"
+        ).execute()
         
-        for row in all_values[1:]:
-            if len(row) >= 3:
-                cell_link = row[2]
+        values = result.get('values', [])
+        
+        for row in values[2:]:
+            if row and len(row) > 0:
+                cell_link = row[0]
                 if short_link in cell_link or video_url in cell_link:
                     return True
         return False
@@ -353,76 +938,84 @@ async def is_video_already_in_sheet(video_url):
 async def write_to_google_sheets_async(video_url: str, user_name: str, is_anonymous: bool):
     """Асинхронная запись в Google Sheets (используется в очереди)"""
     try:
-        sheet = await get_google_sheet()
-        if sheet is None:
-            raise Exception("Отсутствует подключение к Google Sheets")
-        
-        # Проверяем и применяем форматирование таблицы перед записью
-        await ensure_headers_and_formatting(sheet)
+        service = await get_sheets_service()
+        if service is None:
+            raise Exception("Отсутствует подключение к Google Sheets API")
         
         video_id = extract_youtube_id(video_url)
         if not video_id:
             logger.error(f"Не удалось извлечь ID видео из ссылки: {video_url}")
             return False
         
-        # Получаем информацию о видео асинхронно
-        video_title, thumbnail_url = await fetch_video_info(video_id)
+        video_title, thumbnail_url, duration = await fetch_video_info(video_id)
         short_link = f"https://youtu.be/{video_id}"
         
         if not video_title:
             video_title = f"Видео от {user_name if not is_anonymous else 'Анонима'}"
+        
+        if not duration:
+            duration = "0:00:00"
         
         if thumbnail_url:
             preview_formula = f'=IMAGE("{thumbnail_url}"; 2)'
         else:
             preview_formula = f'=IMAGE("https://img.youtube.com/vi/{video_id}/mqdefault.jpg"; 2)'
         
-        # Определяем имя для записи
         author_name = "Аноним" if is_anonymous else user_name
         
-        # Получаем текущую дату и время по Москве
         moscow_now = get_moscow_datetime()
         formatted_date = format_moscow_date(moscow_now)
         
-        # Данные для записи
-        row_data = [
-            preview_formula,
-            video_title,
-            short_link,
-            author_name,
-            formatted_date
-        ]
+        row_data = []
+        num_columns = len(EXPECTED_HEADERS)
         
-        # Выполняем синхронные операции Google Sheets в отдельном потоке
-        loop = asyncio.get_event_loop()
+        if num_columns >= 1:
+            row_data.append(preview_formula)
+        if num_columns >= 2:
+            row_data.append(video_title)
+        if num_columns >= 3:
+            row_data.append(f"'{duration}")
+        if num_columns >= 4:
+            row_data.append(short_link)
+        if num_columns >= 5:
+            row_data.append(author_name)
+        if num_columns >= 6:
+            row_data.append(formatted_date)
+        if num_columns >= 7:
+            row_data.append("не просмотрено")
         
-        # Добавляем строку
-        await loop.run_in_executor(
-            None, 
-            lambda: sheet.append_row(row_data, value_input_option='USER_ENTERED')
-        )
+        for i in range(7, num_columns):
+            row_data.append("")
         
-        # Получаем номер последней строки
-        all_values = await loop.run_in_executor(None, sheet.get_all_values)
-        last_row = len(all_values)
+        spreadsheet = service.spreadsheets()
         
-        # Применяем форматирование для новой строки
-        fmt = cellFormat(
-            verticalAlignment='MIDDLE',
-            wrapStrategy='WRAP'
-        )
+        body = {
+            'values': [row_data]
+        }
         
-        await loop.run_in_executor(
-            None,
-            lambda: format_cell_range(sheet, f'A{last_row}:E{last_row}', fmt)
-        )
+        result = spreadsheet.values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"{SHEET_NAME}!A:{chr(65 + len(EXPECTED_HEADERS) - 1)}"
+        ).execute()
         
-        await loop.run_in_executor(
-            None,
-            lambda: set_row_height(sheet, f'{last_row}:{last_row}', ROW_HEIGHT)
-        )
+        values = result.get('values', [])
+        insert_row = len(values) + 1
         
-        logger.info(f"Данные записаны в строку {last_row}: {video_title} от {author_name} в {formatted_date}")
+        spreadsheet.values().append(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"{SHEET_NAME}!A{insert_row}:{chr(65 + len(EXPECTED_HEADERS) - 1)}{insert_row}",
+            valueInputOption='USER_ENTERED',
+            insertDataOption='INSERT_ROWS',
+            body=body
+        ).execute()
+        
+        await create_dropdown_for_new_row(insert_row)
+        
+        new_total_rows = await get_total_rows()
+        await apply_formatting_after_add(new_total_rows)
+        
+        video_id = extract_youtube_id(video_url)
+        logger.info(f"Добавлено видео \"{short_link}\" от пользователя \"{author_name}\"")
         return True
         
     except Exception as e:
@@ -432,9 +1025,7 @@ async def write_to_google_sheets_async(video_url: str, user_name: str, is_anonym
 def is_youtube_link(url: str) -> bool:
     match = re.match(YOUTUBE_REGEX, url)
     if match:
-        # Проверяем, не является ли ссылка на YouTube Shorts
         url_lower = url.lower()
-        # Исключаем ссылки на shorts
         if '/shorts/' in url_lower:
             return False
         return True
@@ -454,22 +1045,19 @@ def create_video_key(video_url: str, user_id: int) -> str:
     return f"{user_id}_{hashlib.md5(video_url.encode()).hexdigest()[:16]}"
 
 # ------------------ Обработчики команд ------------------
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = user.id
     chat_id = update.effective_chat.id
     
-    # Создаем уникальный ключ для комбинации чат+пользователь
     user_chat_key = f"{chat_id}_{user_id}"
     
-    # Проверяем, использовал ли этот пользователь уже /start в этом чате
     if user_chat_key in started_users:
-        # Короткая версия для повторного использования
         short_text = "Просто отправь мне ссылку на YouTube видео, и я добавлю её в предложку.\n\nЕсли нужна помощь, используй /help"
         await update.message.reply_text(short_text)
         return
     
-    # Первое использование /start этим пользователем в этом чате
     started_users.add(user_chat_key)
     
     welcome_text_part1 = (
@@ -511,7 +1099,7 @@ async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"*Как работает:*\n"
         f"1. Вы отправляете ссылку на полнометражное YouTube видео\n"
         f"2. Бот проверяет ссылку и предлагает выбрать: добавить анонимно или с вашим именем\n"
-        f"3. После подтверждения видео добавляется в общую таблицу\n"
+        f"3. После подтверждения видео добавляется в общую таблице\n"
         f"p.s. Посмотреть полный список видео можно по команде /list\n\n"
         f"*Поддерживаемые форматы YouTube ссылок:*\n"
         f"• https://youtube.com/watch?v=ID\n"
@@ -529,7 +1117,6 @@ async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        # Получаем количество видео из таблицы (без форматирования таблицы)
         video_count = await get_video_count_from_sheet()
         
         if video_count == 0:
@@ -553,7 +1140,7 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Ошибка при выполнении команды /list: {e}")
         await update.message.reply_text(
-            f"❌ Произошла ошибка при получении информации из таблицы. Попробуйте позже."
+            f"❌ Произошла ошибка при получении информации из таблицы. Попробуйте позже или свяжитесь с разработчиком @NoirBane"
         )
 
 async def ask_anonymous_choice(update: Update, context: ContextTypes.DEFAULT_TYPE, video_url: str, user_name: str):
@@ -562,10 +1149,8 @@ async def ask_anonymous_choice(update: Update, context: ContextTypes.DEFAULT_TYP
     user_id = user.id
     chat_id = update.effective_chat.id
     
-    # Создаем уникальный ключ для этого видео
     video_key = create_video_key(video_url, user_id)
     
-    # Сохраняем информацию о видео в безопасное хранилище
     video_data = PendingVideo(
         video_url=video_url,
         user_name=user_name,
@@ -576,7 +1161,6 @@ async def ask_anonymous_choice(update: Update, context: ContextTypes.DEFAULT_TYP
     
     await pending_videos.add(video_key, video_data)
     
-    # Создаем кнопки
     keyboard = [
         [
             InlineKeyboardButton("✅ Да, с моим именем", callback_data=f"name_{video_key}"),
@@ -586,126 +1170,156 @@ async def ask_anonymous_choice(update: Update, context: ContextTypes.DEFAULT_TYP
     
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    video_id = extract_youtube_id(video_url)
-    short_link = f"https://youtu.be/{video_id}" if video_id else video_url
-    
-    message = await update.message.reply_text(
-        f"Хотите, чтобы в таблице было указано ваше имя?\n"
-        f"👤 Ваше имя: {user_name}\n\n"
-        f"По умолчанию: 🚫 Анонимно",
-        reply_markup=reply_markup
-    )
-    
-    # Сохраняем ID сообщения
-    video_data.message_id = message.message_id
-    await pending_videos.add(video_key, video_data)
+    try:
+        message = await update.message.reply_text(
+            f"Хотите, чтобы в таблице было указано ваше имя и тег?\n"
+            f"👤 Ваше имя: {user_name}",
+            reply_markup=reply_markup
+        )
+        video_data.message_id = message.message_id
+        await pending_videos.add(video_key, video_data)
+    except Exception as e:
+        logger.error(f"Не удалось отправить сообщение с выбором анонимности: {e}")
+        try:
+            await update.message.reply_text(
+                f"Хотите, чтобы в таблице было указано ваше имя и тег?\n"
+                f"👤 Ваше имя: {user_name}\n\n"
+                f"К сожалению, произошла ошибка при создании кнопок. "
+                f"Пожалуйста, отправьте ссылку на видео еще раз или свяжитесь с разработчиком @NoirBane"
+            )
+        except:
+            pass
 
 async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает нажатия на кнопки"""
+    """Оптимизированный обработчик callback-запросов с упрощенным UX"""
     query = update.callback_query
-    await query.answer()
     
-    user = query.from_user
-    user_id = user.id
+    try:
+        await query.edit_message_text("⏳ Видео добавляется в таблицу, пожалуйста, ожидайте...")
+    except Exception as e:
+        logger.warning(f"Не удалось обновить сообщение: {e}")
+        try:
+            if update.effective_chat:
+                await update.effective_chat.send_message("⏳ Видео добавляется в таблицу, пожалуйста, ожидайте...")
+        except Exception as send_error:
+            logger.error(f"Не удалось отправить сообщение: {send_error}")
     
-    # Извлекаем данные из callback
+    async def answer_telegram():
+        try:
+            await query.answer()
+        except Exception as e:
+            logger.debug(f"Не ответили на callback: {e}")
+    
+    asyncio.create_task(answer_telegram())
+    
     callback_data = query.data
     
     if callback_data.startswith("name_"):
-        video_key = callback_data.replace("name_", "")
+        video_key = callback_data[5:]
         is_anonymous = False
     elif callback_data.startswith("anon_"):
-        video_key = callback_data.replace("anon_", "")
+        video_key = callback_data[5:]
         is_anonymous = True
     else:
-        await query.edit_message_text("❌ Ошибка обработки запроса. Попробуйте еще раз.")
+        error_msg = "❌ Ошибка обработки запроса. Попробуйте еще раз или свяжитесь с разработчиком @NoirBane"
+        try:
+            await query.edit_message_text(error_msg)
+        except:
+            if update.effective_chat:
+                await update.effective_chat.send_message(error_msg)
         return
     
-    # Получаем информацию о видео из безопасного хранилища
+    user_id = query.from_user.id
+    
     video_data = await pending_videos.get(video_key)
     if not video_data:
-        await query.edit_message_text("❌ Ссылка устарела. Пожалуйста, отправьте видео еще раз.")
+        error_msg = "❌ Ссылка устарела. Пожалуйста, отправьте видео еще раз или свяжитесь с разработчиком @NoirBane"
+        try:
+            await query.edit_message_text(error_msg)
+        except:
+            if update.effective_chat:
+                await update.effective_chat.send_message(error_msg)
         return
+    
+    if user_id != video_data.user_id:
+        error_msg = "❌ Это не ваше видео! Если возникли проблемы, свяжитесь с разработчиком @NoirBane"
+        try:
+            await query.edit_message_text(error_msg)
+        except:
+            if update.effective_chat:
+                await update.effective_chat.send_message(error_msg)
+        return
+    
+    asyncio.create_task(pending_videos.remove(video_key))
     
     video_url = video_data.video_url
     user_name = video_data.user_name
     
-    # Проверяем, что пользователь совпадает
-    if user_id != video_data.user_id:
-        await query.edit_message_text("❌ Это не ваше видео!")
-        return
-    
-    # Удаляем видео из временного хранилища
-    await pending_videos.remove(video_key)
-    
-    # Показываем сообщение "ожидайте"
-    await query.edit_message_text(
-        "⏳ Видео добавляется в таблицу, пожалуйста, ожидайте..."
-    )
-    
-    # Проверяем, не добавили ли видео уже в таблицу
-    if await is_video_already_in_sheet(video_url):
-        await query.edit_message_text(
-            "⚠️ Это видео уже есть в предложке!\n\n"
-            "Проверьте полный список через /list"
-        )
-        return
-    
-    try:
-        # Добавляем задачу в очередь на запись
-        success = await write_queue.add_write_task(
-            write_to_google_sheets_async,
-            video_url,
-            user_name,
-            is_anonymous
-        )
-        
-        # Получаем информацию о видео для отображения
-        video_id = extract_youtube_id(video_url)
-        short_link = f"https://youtu.be/{video_id}" if video_id else video_url
-        
-        if success:
-            # Получаем текущую дату для отображения в сообщении
-            moscow_now = get_moscow_datetime()
-            formatted_date = format_moscow_date(moscow_now)
+    async def add_video_task():
+        try:
+            if await is_video_already_in_sheet(video_url):
+                error_msg = "⚠️ Это видео уже есть в предложке!\n\nПроверьте полный список через /list"
+                try:
+                    await query.edit_message_text(error_msg)
+                except:
+                    if update.effective_chat:
+                        await update.effective_chat.send_message(error_msg)
+                return
             
-            author_text = f"👤 От: {user_name}" if not is_anonymous else "👤 От: Анонимно"
-            
-            success_message = (
-                f"✅ Видео успешно добавлено!\n\n"
-                f"📹 Ссылка: {short_link}\n"
-                f"{author_text}\n"
-                f"🕐 Дата: {formatted_date}\n\n"
-                f"🎬 Спасибо за предложку!"
+            success = await write_queue.add_write_task(
+                write_to_google_sheets_async,
+                video_url,
+                user_name,
+                is_anonymous
             )
             
-            # Обновляем сообщение с результатом
-            await query.edit_message_text(
-                success_message
-            )
+            video_id = extract_youtube_id(video_url)
+            short_link = f"https://youtu.be/{video_id}" if video_id else video_url
             
-            # Обновляем статистику
-            user_submissions[user_id] += 1
+            if success:
+                moscow_now = get_moscow_datetime()
+                formatted_date = format_moscow_date(moscow_now)
+                
+                author_text = f"👤 От: {user_name}" if not is_anonymous else "👤 От: Анонимно"
+                
+                success_message = (
+                    f"✅ Видео успешно добавлено!\n\n"
+                    f"📹 Ссылка: {short_link}\n"
+                    f"{author_text}\n"
+                    f"🕐 Дата: {formatted_date}\n\n"
+                    f"🎬 Спасибо за предложку!"
+                )
+                
+                user_submissions[user_id] += 1
+                
+            else:
+                success_message = (
+                    f"❌ Не удалось добавить видео\n\n"
+                    f"📹 Ссылка: {short_link}\n\n"
+                    f"⚠️ Попробуйте еще раз или свяжитесь с разработчиком @NoirBane"
+                )
             
-            logger.info(f"Пользователь {user.id} добавил видео: {short_link} в {formatted_date}")
-        else:
-            error_message = (
-                f"❌ Не удалось добавить видео\n\n"
-                f"📹 Ссылка: {short_link}\n\n"
-                f"⚠️ Попробуйте еще раз или свяжитесь с администратором."
-            )
+            try:
+                await query.edit_message_text(success_message)
+            except Exception as e:
+                logger.warning(f"Не удалось обновить сообщение: {e}")
+                if update.effective_chat:
+                    try:
+                        await update.effective_chat.send_message(success_message)
+                    except Exception as send_error:
+                        logger.error(f"Не удалось отправить сообщение пользователю: {send_error}")
+                        
+        except Exception as e:
+            logger.error(f"Ошибка в фоновой задаче добавления видео: {e}")
             
-            await query.edit_message_text(
-                error_message
-            )
-            
-            logger.error(f"Ошибка при добавлении видео пользователем {user.id}: {video_url}")
-            
-    except Exception as e:
-        logger.error(f"Ошибка при обработке callback: {e}")
-        await query.edit_message_text(
-            "❌ Произошла ошибка при добавлении видео. Попробуйте еще раз."
-        )
+            error_message = "❌ Произошла ошибка при добавлении видео. Попробуйте еще раз или свяжитесь с разработчиком @NoirBane"
+            try:
+                await query.edit_message_text(error_message)
+            except:
+                if update.effective_chat:
+                    await update.effective_chat.send_message(error_message)
+    
+    asyncio.create_task(add_video_task())
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message_text = update.message.text
@@ -720,7 +1334,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if 'http' in message_text.lower() or 'youtu' in message_text.lower():
         if is_youtube_link(message_text):
-            # Проверяем, есть ли видео уже в таблице
             if await is_video_already_in_sheet(message_text):
                 await update.message.reply_text(
                     "⚠️ Это видео уже есть в предложке!\n"
@@ -728,18 +1341,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
             
-            # Сохраняем информацию о видео
             video_id = extract_youtube_id(message_text)
             user_name = user.first_name
             if user.username:
                 user_name = f"{user_name} (@{user.username})"
             
-            # Сразу спрашиваем пользователя о выборе анонимности
             await ask_anonymous_choice(update, context, message_text, user_name)
             
         else:
             await update.message.reply_text(
-                "❌ Это ссылка не на YouTube видео или формата shorts!\n\n"
+                "❌ Это ссылка не на YouTube видео или она формата shorts!\n\n"
                 "Я принимаю только ссылки на полнометражные видео YouTube.\n\n"
                 "Примеры правильных ссылок:\n"
                 "• https://youtube.com/watch?v=dQw4w9WgXcQ\n"
@@ -748,7 +1359,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Попробуйте отправить другую ссылку"
             )
     else:
-        # Проверяем, использовал ли пользователь уже /start в этом чате
         user_chat_key = f"{chat_id}_{user.id}"
         if user_chat_key in started_users:
             response = f"Привет, {user.first_name}! Я жду от тебя ссылку на YouTube видео. Просто отправь её мне, и я добавлю в предложку.\n\nЕсли нужна помощь, используй /help"
@@ -760,30 +1370,39 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Ошибка при обработке сообщения: {context.error}", exc_info=True)
     if update and update.effective_message:
-        await update.effective_message.reply_text(
-            "😕 Произошла ошибка при обработке запроса.\n"
-            "Попробуйте еще раз или свяжитесь с разработчиком."
-        )
+        try:
+            await update.effective_message.reply_text(
+                "😕 Произошла ошибка при обработке запроса.\n"
+                "Попробуйте еще раз или свяжитесь с разработчиком @NoirBane"
+            )
+        except Exception as e:
+            logger.error(f"Не удалось отправить сообщение об ошибке: {e}")
 
 async def periodic_cleanup():
     """Периодическая очистка устаревших данных"""
     while True:
         try:
-            # Очищаем старые записи каждые 5 минут
             cleaned = await pending_videos.cleanup_old()
             if cleaned > 0:
                 logger.info(f"Очищено {cleaned} устаревших записей")
         except Exception as e:
             logger.error(f"Ошибка при очистке устаревших данных: {e}")
         
-        await asyncio.sleep(300)  # 5 минут
+        await asyncio.sleep(300)
 
 async def startup(app: Application):
     """Действия при запуске бота"""
     logger.info("Бот запускается...")
-    await write_queue.start()
     
-    # Запускаем периодическую очистку
+    logger.info("Инициализация Google Sheets...")
+    if await initialize_google_sheets():
+        logger.info("Google Sheets успешно инициализирован")
+    else:
+        logger.error("Не удалось инициализировать Google Sheets")
+    
+    await write_queue.start()
+    logger.info("Очередь записи запущена")
+    
     asyncio.create_task(periodic_cleanup())
     logger.info("Фоновые задачи запущены")
 
@@ -806,7 +1425,7 @@ def check_config():
     if "ваш_токен" in TOKEN or "example" in TOKEN.lower():
         logger.error("В файле .env указан неверный токен.")
         return False
-    logger.info("Конфигурация загружена.")
+    logger.info("Конфигурация загружена успешно.")
     return True
 
 def main():
@@ -814,33 +1433,27 @@ def main():
         return
     
     try:
-        # Создаем приложение с использованием современных методов
         app = Application.builder().token(TOKEN).build()
         
-        # Регистрируем обработчики
         app.add_handler(CommandHandler("start", start_command))
         app.add_handler(CommandHandler("list", list_command))
         app.add_handler(CommandHandler("info", info_command))
         app.add_handler(CommandHandler("help", help_command))
         
-        # Добавляем обработчик callback запросов
         app.add_handler(CallbackQueryHandler(handle_callback_query))
         
-        # Обработчик текстовых сообщений
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
         
-        # Обработчик ошибок
         app.add_error_handler(error_handler)
         
-        # Регистрируем обработчики запуска и остановки
         app.post_init = startup
         app.post_stop = shutdown
         
-        logger.info("Бот запускается...")
+        logger.info("Запуск бота...")
         app.run_polling(allowed_updates=Update.ALL_TYPES)
         
     except Exception as e:
-        logger.error(f"Ошибка при запуске бота: {e}", exc_info=True)
+        logger.error(f"Критическая ошибка при запуске бота: {e}", exc_info=True)
 
 if __name__ == '__main__':
     main()
