@@ -86,6 +86,8 @@ logger = setup_logging()
 
 # ------------------ Глобальные переменные и структуры данных ------------------
 
+AUTO_CLEANUP_TIME = "03:00"  # Формат "ЧЧ:ММ" по московскому времени
+
 @dataclass
 class PendingVideo:
     """Безопасная структура для хранения ожидающих видео"""
@@ -316,7 +318,6 @@ async def initialize_google_sheets():
         await ensure_headers_and_formatting()
         
         _is_initialized = True
-        logger.info("Google Sheets успешно инициализирован")
         return True
         
     except Exception as e:
@@ -800,6 +801,240 @@ async def ensure_headers_and_formatting():
     except Exception as e:
         logger.error(f"Ошибка при проверке заголовков и форматировании: {e}")
         return False
+
+# ------------------ Функция удаления ------------------
+
+async def cleanup_videos():
+    """Удаляет видео со статусами 'просмотрено' и 'удалить'"""
+    try:
+        service = await get_sheets_service()
+        if service is None:
+            logger.error("Не удалось получить сервис Google Sheets для очистки")
+            return 0
+        
+        spreadsheet = service.spreadsheets()
+        
+        result = spreadsheet.values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"{SHEET_NAME}!A3:{chr(65 + len(EXPECTED_HEADERS) - 1)}",
+            majorDimension="ROWS"
+        ).execute()
+        
+        values = result.get('values', [])
+        if not values:
+            logger.info("Нет данных для очистки")
+            return 0
+        
+        status_column_index = len(EXPECTED_HEADERS) - 1
+        
+        videos_to_keep = []
+        deleted_count = 0
+        
+        for row in values:
+            if len(row) > status_column_index:
+                status = row[status_column_index].strip().lower()
+                if status in ['просмотрено', 'удалить']:
+                    deleted_count += 1
+                else:
+                    videos_to_keep.append(row)
+            else:
+                videos_to_keep.append(row)
+        
+        if deleted_count == 0:
+            logger.info("Не найдено видео для удаления")
+            return 0
+        
+        logger.info(f"Начало удаления: всего видео {len(values)}, удалится {deleted_count}")
+        
+        total_rows_result = spreadsheet.values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"{SHEET_NAME}!A:{chr(65 + len(EXPECTED_HEADERS) - 1)}"
+        ).execute()
+        
+        total_rows = len(total_rows_result.get('values', []))
+        
+        if total_rows <= 2:
+            logger.info("В таблице только заголовки, удаление не требуется")
+            return 0
+        
+        sheet_id = await get_sheet_id_cached(service)
+        if sheet_id is None:
+            logger.error("Не удалось получить ID листа")
+            return 0
+        
+        try:
+            delete_request = {
+                'deleteDimension': {
+                    'range': {
+                        'sheetId': sheet_id,
+                        'dimension': 'ROWS',
+                        'startIndex': 2,
+                        'endIndex': total_rows
+                    }
+                }
+            }
+            
+            batch_request = {
+                'requests': [delete_request]
+            }
+            
+            spreadsheet.batchUpdate(
+                spreadsheetId=SPREADSHEET_ID,
+                body=batch_request
+            ).execute()
+            
+        except Exception as delete_error:
+            logger.error(f"Ошибка при удалении строк: {delete_error}")
+            return 0
+        
+        if videos_to_keep:
+            rows_to_insert = []
+            
+            for row in videos_to_keep:
+                while len(row) < len(EXPECTED_HEADERS):
+                    row.append("")
+                
+                new_row = row.copy()
+                
+                if len(new_row) > status_column_index:
+                    current_status = new_row[status_column_index].strip().lower()
+                    if current_status not in ['просмотрено', 'удалить', 'не просмотрено']:
+                        new_row[status_column_index] = 'не просмотрено'
+                
+                rows_to_insert.append(new_row)
+            
+            if rows_to_insert:
+                body = {
+                    'values': rows_to_insert
+                }
+                
+                spreadsheet.values().update(
+                    spreadsheetId=SPREADSHEET_ID,
+                    range=f"{SHEET_NAME}!A3",
+                    valueInputOption='USER_ENTERED',
+                    body=body
+                ).execute()
+        
+        if videos_to_keep:
+            await asyncio.sleep(1)
+            
+            result = spreadsheet.values().get(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"{SHEET_NAME}!A3:{chr(65 + len(EXPECTED_HEADERS) - 1)}",
+                majorDimension="ROWS"
+            ).execute()
+            
+            values = result.get('values', [])
+            
+            if values:
+                updated_rows = []
+                
+                for row in values:
+                    while len(row) < len(EXPECTED_HEADERS):
+                        row.append("")
+                    
+                    new_row = row.copy()
+                    
+                    if len(new_row) > 2 and new_row[2]:
+                        duration = new_row[2]
+                        if not duration.startswith("'"):
+                            new_row[2] = f"'{duration}"
+                    
+                    if len(new_row) > 3 and new_row[3]:
+                        video_link = new_row[3]
+                        video_id = extract_youtube_id(video_link)
+                        
+                        if video_id:
+                            preview_formula = f'=IMAGE("https://img.youtube.com/vi/{video_id}/hqdefault.jpg"; 2)'
+                            new_row[0] = preview_formula
+                    
+                    updated_rows.append(new_row)
+                
+                clear_range = f"{SHEET_NAME}!A3:{chr(65 + len(EXPECTED_HEADERS) - 1)}"
+                spreadsheet.values().clear(
+                    spreadsheetId=SPREADSHEET_ID,
+                    range=clear_range,
+                    body={}
+                ).execute()
+                
+                await asyncio.sleep(1)
+                
+                if updated_rows:
+                    body = {
+                        'values': updated_rows
+                    }
+                    
+                    spreadsheet.values().update(
+                        spreadsheetId=SPREADSHEET_ID,
+                        range=f"{SHEET_NAME}!A3",
+                        valueInputOption='USER_ENTERED',
+                        body=body
+                    ).execute()
+        
+        await asyncio.sleep(1)
+        
+        new_total_rows = await get_total_rows()
+        logger.info(f"Удаление завершено: всего видео {new_total_rows - 2}")
+        
+        await apply_formatting_after_add(new_total_rows)
+        
+        if new_total_rows > 2:
+            for row_index in range(3, new_total_rows + 1):
+                try:
+                    await create_dropdown_for_new_row(row_index)
+                    if row_index % 10 == 0:
+                        await asyncio.sleep(0.5)
+                except Exception as e:
+                    continue
+        
+        return deleted_count
+        
+    except Exception as e:
+        logger.error(f"Ошибка при удалении видео: {e}", exc_info=True)
+        return 0
+
+# ------------------ Автоматическая очистка по времени ------------------
+
+async def check_and_run_auto_cleanup():
+    """Проверяет время и запускает автоматическую очистку если нужно"""
+    try:
+        moscow_now = get_moscow_datetime()
+        current_time_str = moscow_now.strftime("%H:%M")
+        
+        if current_time_str == AUTO_CLEANUP_TIME:
+            logger.info(f"Время для автоматической очистки: {AUTO_CLEANUP_TIME} МСК")
+            
+            start_time = datetime.now()
+            deleted_count = await cleanup_videos()
+            end_time = datetime.now()
+            
+            duration = (end_time - start_time).total_seconds()
+            
+            if deleted_count > 0:
+                logger.info(f"Автоматическая очистка завершена за {duration:.2f} сек. Удалено строк: {deleted_count}")
+            else:
+                logger.info(f"Автоматическая очистка завершена за {duration:.2f} сек. Нечего удалять")
+                
+            return True
+        return False
+        
+    except Exception as e:
+        logger.error(f"Ошибка при проверке времени автоматической очистки: {e}")
+        return False
+
+async def auto_cleanup_scheduler():
+    """Планировщик автоматической очистки по времени"""
+    logger.info(f"Автоматическая очистка настроена на время {AUTO_CLEANUP_TIME} МСК")
+    
+    while True:
+        try:
+            await asyncio.sleep(60)
+            
+            await check_and_run_auto_cleanup()
+            
+        except Exception as e:
+            logger.error(f"Ошибка в планировщике автоматической очистки: {e}")
+            await asyncio.sleep(300)
 
 # ------------------ Вспомогательные функции ------------------
 
@@ -1403,7 +1638,17 @@ async def startup(app: Application):
     await write_queue.start()
     logger.info("Очередь записи запущена")
     
+    logger.info("Запуск очистки завершенных видео...")
+    deleted_count = await cleanup_videos()
+    if deleted_count > 0:
+        logger.info(f"Удалено завершенных видео: {deleted_count}")
+    else:
+        logger.info("Завершенных видео для удаления не найдено")
+    
+    # Запускаем все фоновые задачи
     asyncio.create_task(periodic_cleanup())
+    asyncio.create_task(auto_cleanup_scheduler())
+    
     logger.info("Фоновые задачи запущены")
 
 async def shutdown(app: Application):
